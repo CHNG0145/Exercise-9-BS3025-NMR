@@ -1,0 +1,267 @@
+#### Rscript Code A: for CSP tracking and labeling
+library(dplyr)
+library(writexl)
+library(readr)
+library(tcltk)  # For file selection dialogs
+
+# Function to read the structured spectral data file
+read_spectral_data <- function(file_path) {
+  lines <- readLines(file_path)
+  header <- lines[1]
+  
+  data <- data.frame(
+    index = integer(),
+    value1 = numeric(),
+    value2 = numeric(),
+    flag = character(),
+    comment = character(),
+    full_line = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process lines, attaching comments to the *previous* data line
+  for (i in 2:length(lines)) {
+    line <- lines[i]
+    trimmed_line <- trimws(line)
+    
+    if (trimmed_line == "") next
+    
+    if (grepl("^\\s*#", trimmed_line)) {
+      # It's a comment line: attach to previous row if it exists
+      if (nrow(data) > 0) {
+        data$comment[nrow(data)] <- gsub("^\\s*#\\s*", "", trimmed_line)
+      }
+    } else {
+      # It's a data line
+      fields <- strsplit(trimmed_line, "\\s+")[[1]]
+      fields <- fields[fields != ""]
+      
+      if (length(fields) >= 5) {
+        new_row <- data.frame(
+          index = as.integer(fields[1]),
+          value1 = as.numeric(fields[2]),
+          value2 = as.numeric(fields[3]),
+          flag = fields[5],
+          comment = "",  # will be filled in later if a comment line follows
+          full_line = line,
+          stringsAsFactors = FALSE
+        )
+        data <- rbind(data, new_row)
+      }
+    }
+  }
+  
+  return(list(header = header, data = data))
+}
+
+# File selection dialogs
+select_file <- function(prompt) {
+  file_path <- tclvalue(tkgetOpenFile(title = prompt, filetypes = "{{All files} {*}}"))
+  if (!nzchar(file_path)) stop("No file selected")
+  return(file_path)
+}
+
+select_output_folder <- function() {
+  folder_path <- tclvalue(tkchooseDirectory(title = "Select Output Folder"))
+  if (!nzchar(folder_path)) stop("No folder selected")
+  return(folder_path)
+}
+
+# Extract coordinates
+extract_coordinates <- function(data) {
+  data.frame(x = data$value1, y = data$value2, label = data$comment)
+}
+
+# Euclidean distance
+euclidean_distance <- function(x1, y1, x2, y2) sqrt((x1 - x2)^2 + (y1 - y2)^2)
+
+# Pairwise distances
+pairwise_distances <- function(coords_ref, coords_unk) {
+  distances <- outer(
+    1:nrow(coords_ref),
+    1:nrow(coords_unk),
+    Vectorize(function(i, j) {
+      euclidean_distance(coords_ref$x1[i], coords_ref$y1[i], coords_unk$x2[j], coords_unk$y2[j])
+    })
+  )
+  distances_df <- as.data.frame(distances)
+  rownames(distances_df) <- coords_ref$label
+  colnames(distances_df) <- paste0(1:nrow(coords_unk))
+  distances_df
+}
+
+# Write spectral format output
+write_spectral_format <- function(matches, unlabeled_data, header, output_file) {
+  con <- file(output_file, "w")
+  writeLines(header, con)
+  
+  for (i in 1:nrow(matches)) {
+    index <- i
+    x <- matches$x2[i]
+    y <- matches$y2[i]
+    ref_id <- matches$Reference_ID[i]
+    
+    data_line <- sprintf("%10d%15.4f%15.4f%2d -%15.3E%15.3E -  0     0     0     0",
+                         index, x, y, 1, 0, 0)
+    comment_line <- sprintf("       # %s", ref_id)
+    
+    writeLines(data_line, con)
+    writeLines(comment_line, con)
+  }
+  
+  close(con)
+  cat("Spectral format data saved to:", output_file, "\n")
+  return(output_file)
+}
+
+# Main processing function
+process_spectral_data <- function(interactive_mode = TRUE, ref_file = NULL, unlabeled_file = NULL, output_dir = NULL) {
+  if (interactive_mode) {
+    cat("Please select the REFERENCE data file (labeled data)\n")
+    ref_file <- select_file("Select Labeled Data File")
+    cat("Please select the UNLABELED data file\n")
+    unlabeled_file <- select_file("Select Unlabeled Data File")
+    cat("Please select the OUTPUT folder for results\n")
+    output_dir <- select_output_folder()
+  } else {
+    if (is.null(ref_file) || is.null(unlabeled_file) || is.null(output_dir)) {
+      stop("In non-interactive mode, ref_file, unlabeled_file, and output_dir must be provided")
+    }
+  }
+  
+  cat("Reading reference file:", ref_file, "\n")
+  data_ref_full <- read_spectral_data(ref_file)
+  data_ref <- data_ref_full$data
+  
+  cat("Reading unlabeled file:", unlabeled_file, "\n")
+  data_unk_full <- read_spectral_data(unlabeled_file)
+  data_unk <- data_unk_full$data
+  
+  coords_raw_ref <- extract_coordinates(data_ref)
+  coords_raw_unk <- extract_coordinates(data_unk)
+  
+  coords_ref <- coords_raw_ref %>%
+    filter(label != "") %>%
+    rename(x1 = x, y1 = y)
+  
+  coords_unk <- coords_raw_unk %>%
+    rename(x2 = x, y2 = y)
+  
+  cat("\nReference data points:", nrow(coords_ref), "with labels\n")
+  cat("Unlabeled data points:", nrow(coords_unk), "\n")
+  
+  cat("Calculating distance matrix...\n")
+  distance_matrix <- pairwise_distances(coords_ref, coords_unk)
+  
+  min_distance_columns <- apply(distance_matrix, 1, function(row) colnames(distance_matrix)[which.min(row)])
+  minimum_match_df <- data.frame(Minimum_Distance_Column = min_distance_columns, row.names = rownames(distance_matrix))
+  
+  matched_coords <- data.frame(
+    x2 = coords_unk$x2[as.numeric(minimum_match_df$Minimum_Distance_Column)],
+    y2 = coords_unk$y2[as.numeric(minimum_match_df$Minimum_Distance_Column)],
+    Minimum_Distance_Column = minimum_match_df$Minimum_Distance_Column,
+    Reference_ID = rownames(minimum_match_df)
+  )
+  
+  duplicate_indices <- duplicated(matched_coords$Minimum_Distance_Column) |
+    duplicated(matched_coords$Minimum_Distance_Column, fromLast = TRUE)
+  
+  non_overlapping_coords <- matched_coords[!duplicate_indices, ]
+  
+  duplicate_report <- matched_coords[duplicate_indices, ] %>%
+    group_by(Minimum_Distance_Column) %>%
+    summarise(
+      Conflict_Count = n(),
+      Affected_References = paste(Reference_ID, collapse = ", "),
+      .groups = 'drop'
+    )
+  
+  resolved_matches <- duplicate_report %>%
+    left_join(matched_coords, by = "Minimum_Distance_Column") %>%
+    rowwise() %>%
+    mutate(Distance = as.numeric(distance_matrix[Reference_ID, Minimum_Distance_Column])) %>%
+    ungroup() %>%
+    group_by(Minimum_Distance_Column) %>%
+    slice_min(Distance, n = 1) %>%
+    ungroup() %>%
+    select(x2, y2, Minimum_Distance_Column, Reference_ID, Distance)
+  
+  final_matches <- non_overlapping_coords %>%
+    mutate(Distance = apply(distance_matrix, 1, min)[Reference_ID]) %>%
+    bind_rows(resolved_matches) %>%
+    arrange(Reference_ID) %>%
+    mutate(
+      Match_Number = row_number(),
+      Label = paste("Match", Match_Number)
+    ) %>%
+    select(Label, x2, y2, Reference_ID, Distance, Minimum_Distance_Column)
+  
+  conflict_references <- unlist(strsplit(duplicate_report$Affected_References, ", "))
+  
+  if (length(conflict_references) > 0 && nrow(duplicate_report) > 0) {
+    conflict_distance_df <- distance_matrix[rownames(distance_matrix) %in% conflict_references, , drop = FALSE]
+    conflicted_columns <- as.character(duplicate_report$Minimum_Distance_Column)
+    focused_df <- cbind(Reference = rownames(conflict_distance_df), 
+                        conflict_distance_df[, conflicted_columns, drop = FALSE])
+  } else {
+    focused_df <- data.frame(Reference = character(0))
+  }
+  
+  excel_output <- list(
+    Unique_Matches = as.data.frame(non_overlapping_coords),
+    Duplicate_Report = as.data.frame(duplicate_report),
+    Duplicate_Distances = as.data.frame(focused_df),
+    All_Matches = as.data.frame(matched_coords),
+    Resolved_Matches = as.data.frame(final_matches)
+  )
+  
+  summary_df <- data.frame(
+    Metric = c("Reference Data Points", "Unlabeled Data Points", "Unique Matches", "Duplicate Matches", "Total Matches"),
+    Value = c(nrow(coords_ref), nrow(coords_unk), nrow(non_overlapping_coords), 
+              nrow(duplicate_report), nrow(final_matches))
+  )
+  excel_output$Summary <- summary_df
+  
+  output_file <- normalizePath(
+    file.path(output_dir, paste0("Spectral_Matching_Results_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx")),
+    mustWork = FALSE
+  )
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  
+  tryCatch({
+    writexl::write_xlsx(excel_output, output_file)
+    cat("\nResults successfully saved to:", output_file, "\n")
+  }, error = function(e) {
+    cat("\nWrite failed:", e$message, "\n")
+    print(lapply(excel_output, class))
+  })
+  
+  # Spectral output
+  cat("\nGenerating spectral format output...\n")
+  spectral_file <- normalizePath(
+    file.path(output_dir, paste0("Spectral_Matched_Data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".peaks")),
+    mustWork = FALSE
+  )
+  
+  spectral_output_file <- write_spectral_format(
+    final_matches,
+    data_unk,
+    data_unk_full$header,
+    spectral_file
+  )
+  
+  invisible(list(
+    distance_matrix = distance_matrix,
+    matched_coords = matched_coords,
+    final_matches = final_matches,
+    output_file = output_file,
+    spectral_output_file = spectral_output_file
+  ))
+}
+
+# Run interactively
+if (interactive()) {
+  cat("Starting spectral data processing...\n")
+  result <- process_spectral_data()
+  cat("Processing complete!\n")
+}
