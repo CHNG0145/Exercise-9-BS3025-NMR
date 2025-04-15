@@ -1,0 +1,316 @@
+####Rscript code B for fitting Chemical Shift Perturbation (CSP), in 1:1 format
+library(dplyr)
+library(writexl)
+library(readr)
+library(tcltk)
+library(minpack.lm)
+library(ggplot2)
+
+# Function to read the structured spectral data file
+read_spectral_data <- function(file_path) {
+  lines <- readLines(file_path)
+  header <- lines[1]
+  
+  data <- data.frame(
+    index = integer(),
+    value1 = numeric(),
+    value2 = numeric(),
+    flag = character(),
+    comment = character(),
+    full_line = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 2:length(lines)) {
+    line <- lines[i]
+    trimmed_line <- trimws(line)
+    
+    if (trimmed_line == "") next
+    
+    if (grepl("^\\s*#", trimmed_line)) {
+      if (nrow(data) > 0) {
+        data$comment[nrow(data)] <- gsub("^\\s*#\\s*", "", trimmed_line)
+      }
+    } else {
+      fields <- unlist(strsplit(trimmed_line, "[[:space:]]+"))
+      if (length(fields) >= 5) {
+        new_row <- data.frame(
+          index = as.integer(fields[1]),
+          value1 = as.numeric(fields[3]),
+          value2 = as.numeric(fields[2]),
+          flag = fields[5],
+          comment = "",
+          full_line = line,
+          stringsAsFactors = FALSE
+        )
+        data <- rbind(data, new_row)
+      }
+    }
+  }
+  
+  return(list(header = header, data = data))
+}
+
+select_file <- function(prompt) {
+  file_path <- tclvalue(tkgetOpenFile(title = prompt, filetypes = "{{All files} {*}}"))
+  if (!nzchar(file_path)) stop("No file selected")
+  return(file_path)
+}
+
+select_output_folder <- function() {
+  folder_path <- tclvalue(tkchooseDirectory(title = "Select Output Folder"))
+  if (!nzchar(folder_path)) stop("No folder selected")
+  return(folder_path)
+}
+
+binding_formula <- function(Ka, delta_HG, delta_H, H0, G0) {
+  HG <- 0.5 * ((G0 + H0 + (1/Ka)) - sqrt((G0 + H0 + (1/Ka))^2 - 4 * G0 * H0))
+  H <- H0 - HG
+  calc_response <- ((delta_H * H) + (delta_HG * HG)) / (H + HG)
+  return(calc_response)
+}
+
+fit_and_plot <- function(H0, G0, response, residue_label) {
+  # Remove NAs from the data
+  valid_idx <- !is.na(response)
+  if (sum(valid_idx) < 3) {
+    warning(paste("Not enough valid data points for residue", residue_label))
+    return(NULL)
+  }
+  
+  H0_valid <- H0[valid_idx]
+  G0_valid <- G0[valid_idx]
+  response_valid <- response[valid_idx]
+  
+  
+  data <- data.frame(H0 = H0_valid, G0 = G0_valid, response = response_valid)
+  initial_Ka_values <- 10^seq(0, 5, length.out = 20)
+  best_fit <- NULL
+  best_ssr <- Inf
+  best_r_squared <- NA
+  
+  for (init_Ka in initial_Ka_values) {
+    initial_delta_HG <- max(response_valid)
+    initial_delta_H <- min(response_valid)
+    
+    fit_result <- tryCatch({
+      nlsLM(response ~ binding_formula(Ka, delta_HG, delta_H, H0, G0),
+            data = data,
+            start = list(Ka = init_Ka,
+                         delta_HG = initial_delta_HG,
+                         delta_H = initial_delta_H),
+            control = nls.lm.control(maxiter = 1000))
+    }, error = function(e) {
+      message(paste("Fit error for", residue_label, "Ka =", init_Ka, ":", e$message))
+      return(NULL)
+    })
+    
+    if (!is.null(fit_result)) {
+      ssr <- sum(residuals(fit_result)^2)
+      if (ssr < best_ssr) {
+        best_ssr <- ssr
+        best_fit <- fit_result
+        
+        # Calculate R-squared
+        y_actual <- data$response
+        y_predicted <- fitted(best_fit)
+        tss <- sum((y_actual - mean(y_actual))^2)
+        rss <- sum((y_actual - y_predicted)^2)
+        best_r_squared <- 1 - (rss / tss)
+      }
+    }
+  }
+  
+  if (is.null(best_fit)) {
+    warning(paste("No successful fits found for residue", residue_label, ". Returning NULL."))
+    return(NULL)
+  }
+  
+  best_params <- coef(best_fit)
+  best_Ka <- best_params["Ka"]
+  
+  G0_range <- seq(min(G0_valid), max(G0_valid), length.out = 100)
+  G0_over_H0 <- G0_range / mean(H0_valid)
+  
+  predicted_response <- binding_formula(
+    Ka = best_Ka,
+    delta_HG = best_params["delta_HG"],
+    delta_H = best_params["delta_H"],
+    H0 = mean(H0_valid), G0 = G0_range)
+  
+  plot_data <- data.frame(G0_H0 = G0_over_H0, Response = predicted_response)
+  
+  plot <- ggplot(data.frame(G0 = G0_valid / mean(H0_valid), response = response_valid), aes(x = G0, y = response)) +
+    geom_point(size = 3, color = "blue") +
+    geom_line(data = plot_data, aes(x = G0_H0, y = Response), color = "red") +
+    labs(title = paste("Binding Isotherm for", residue_label),
+         subtitle = paste("Ka =", format(best_Ka, scientific = TRUE, digits = 3),
+                          "\nR-squared =", format(best_r_squared, digits = 3)),
+         x = "G0/H0",
+         y = "Response") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      plot.title = element_text(color = "black"),
+      plot.subtitle = element_text(color = "black")
+    )
+  
+  
+  return(list(Ka = best_Ka, plot = plot, R_squared = best_r_squared))
+}
+
+# Main analysis (rest of your script, modified to use the new fit_and_plot)
+if (interactive()) {
+  output_dir <- select_output_folder()
+  labeled_file <- select_file("Select the FIRST Labeled Data File (Anchor)")
+  labeled_data_full <- read_spectral_data(labeled_file)
+  labeled_data <- labeled_data_full$data
+  
+  new_df <- data.frame(
+    x1 = labeled_data$value1,
+    y1 = labeled_data$value2,
+    stringsAsFactors = FALSE
+  )
+  # Make sure comments are set as row names correctly
+  rownames(new_df) <- labeled_data$comment
+  
+  file_count <- 1
+  continue_loop <- TRUE
+  
+  while (continue_loop) {
+    prompt <- "Select NEXT Labeled Data File (or CANCEL to finish)"
+    next_file <- tryCatch({ select_file(prompt) },
+                          error = function(e) {
+                            cat("File selection cancelled. Stopping file input.\n")
+                            return(NULL)
+                          })
+    
+    if (is.null(next_file)) {
+      continue_loop <- FALSE
+      break
+    }
+    
+    file_count <- file_count + 1
+    col_x <- paste0("x", file_count)
+    col_y <- paste0("y", file_count)
+    
+    next_data_full <- read_spectral_data(next_file)
+    next_data <- next_data_full$data
+    
+    # Initialize columns first to prevent issues
+    new_df[[col_x]] <- NA
+    new_df[[col_y]] <- NA
+    
+    for (i in 1:nrow(next_data)) {
+      comment <- next_data$comment[i]
+      if (comment %in% rownames(new_df)) {
+        new_df[comment, col_x] <- next_data$value1[i]
+        new_df[comment, col_y] <- next_data$value2[i]
+      }
+    }
+  }
+  
+  # Create distance dataframe
+  distance_df <- data.frame(matrix(ncol = file_count + 1, nrow = nrow(new_df)))
+  colnames(distance_df) <- c("Residue", paste0("Distance", 1:file_count))
+  distance_df$Residue <- rownames(new_df)
+  
+  for (i in 1:nrow(new_df)) {
+    residue_label <- rownames(new_df)[i]
+    x1 <- new_df$x1[i]
+    y1 <- new_df$y1[i]
+    
+    distances <- numeric(file_count)
+    distances[1] <- 0  # First point is the reference, so distance is 0
+    
+    for (j in 2:file_count) {
+      x_col <- paste0("x", j)
+      y_col <- paste0("y", j)
+      if (is.na(new_df[i, x_col]) || is.na(new_df[i, y_col])) {
+        distance <- NA
+      } else {
+        xn <- new_df[i, x_col]
+        yn <- new_df[i, y_col]
+        delta_x <- xn - x1
+        delta_y <- yn - y1
+        distance <- sqrt(((delta_x^2) + (0.2*delta_y)^2)/2)
+      }
+      distances[j] <- distance
+    }
+    
+    distance_df[i, 2:ncol(distance_df)] <- distances
+  }
+  
+  # H0 and G0 defined once #################################################################################################
+  H0 <- c(5.00E-04, 4.98E-04, 4.96E-04, 4.96E-04, 4.95E-04, 4.95E-04, 4.89E-04, 4.90E-04)
+  G0 <- c(0, 0.00009684, 0.00029052, 0.0004842,	0.0007263, 0.0009684, 0.0014526, 0.0019368)
+  ##########################################################################################################################
+  
+  # Verify that H0 and G0 match the number of data points
+  if (file_count != length(H0)) {
+    warning("Number of files does not match length of H0. Truncating to the shorter length.")
+    length_to_use <- min(file_count, length(H0))
+    H0 <- H0[1:length_to_use]
+    G0 <- G0[1:length_to_use]
+    for (i in 1:nrow(distance_df)) {
+      distance_df[i, (length_to_use+2):ncol(distance_df)] <- NA
+    }
+    file_count <- length_to_use
+  }
+  
+  output_data <- data.frame(Residue = character(), Ka = numeric(), R_squared = numeric(), Plot_File = character(), stringsAsFactors = FALSE)
+  
+  for (i in 1:nrow(distance_df)) {
+    residue_label <- distance_df$Residue[i]
+    response <- as.numeric(distance_df[i, 2:(file_count+1)])
+    
+    if (sum(!is.na(response)) < 3) {
+      warning(paste("Skipping residue", residue_label, "due to insufficient data points."))
+      next
+    }
+    
+    fit_result <- tryCatch({
+      fit_and_plot(H0, G0, response, residue_label)
+    }, error = function(e) {
+      warning(paste("Error fitting residue", residue_label, ":", e$message))
+      return(NULL)
+    })
+    
+    if (!is.null(fit_result)) {
+      plot_filename <- file.path(output_dir, paste0(residue_label, ".png"))
+      ggsave(filename = plot_filename, plot = fit_result$plot, device = "png", width = 6, height = 4, units = "in")
+      
+      output_data <- rbind(
+        output_data,
+        data.frame(
+          Residue = residue_label,
+          Ka = fit_result$Ka,
+          R_squared = fit_result$R_squared,
+          Plot_File = plot_filename,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+  
+  # Post-processing: calculate Kd and detect Ka outliers
+  if (nrow(output_data) > 0) {
+    output_data$Kd <- 1 / output_data$Ka
+    
+    Q1 <- quantile(output_data$Ka, 0.25, na.rm = TRUE)
+    Q3 <- quantile(output_data$Ka, 0.75, na.rm = TRUE)
+    IQR_Ka <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR_Ka
+    upper_bound <- Q3 + 1.5 * IQR_Ka
+    
+    output_data$Ka_Outlier <- output_data$Ka < lower_bound | output_data$Ka > upper_bound
+  }
+  
+  output_file <- file.path(output_dir, "binding_results.xlsx")
+  writexl::write_xlsx(output_data, path = output_file)
+  cat("Binding analysis complete. Results saved to", output_file, "\n")
+}
